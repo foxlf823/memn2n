@@ -1,0 +1,387 @@
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from six.moves import range
+
+def position_encoding(sentence_size, embedding_size):
+    """
+    Position Encoding described in section 4.1 [1]
+    """
+    encoding = np.ones((embedding_size, sentence_size), dtype=np.float32)
+    ls = sentence_size+1
+    le = embedding_size+1
+    for i in range(1, le):
+        for j in range(1, ls):
+            encoding[i-1, j-1] = (i - (embedding_size+1)/2) * (j - (sentence_size+1)/2)
+    encoding = 1 + 4 * encoding / embedding_size / sentence_size
+    # Make position encoding of time words identity to avoid modifying them 
+    encoding[:, -1] = 1.0
+    return np.transpose(encoding)
+
+class MemN2N(nn.Module):
+    """End-To-End Memory Network."""
+    def __init__(self, use_cuda, batch_size, vocab_size, sentence_size, memory_size, embedding_size,
+        hops=3, nonlin=None, encoding=position_encoding):
+        """Creates an End-To-End Memory Network
+
+        Args:
+            batch_size: The size of the batch.
+
+            vocab_size: The size of the vocabulary (should include the nil word). The nil word
+            one-hot encoding should be 0.
+
+            sentence_size: The max size of a sentence in the data. All sentences should be padded
+            to this length. If padding is required it should be done with nil one-hot encoding (0).
+
+            memory_size: The max size of the memory. Since Tensorflow currently does not support jagged arrays
+            all memories must be padded to this length. If padding is required, the extra memories should be
+            empty memories; memories filled with the nil word ([0, 0, 0, ......, 0]).
+
+            embedding_size: The size of the word embedding.
+
+            hops: The number of hops. A hop consists of reading and addressing a memory slot.
+            Defaults to `3`.
+
+            nonlin: Non-linearity. Defaults to `None`.
+
+            encoding: A function returning a 2D Tensor (sentence_size, embedding_size). Defaults to `position_encoding`.
+        """
+        
+        super(MemN2N, self).__init__()
+        
+        self._batch_size = batch_size
+        self._vocab_size = vocab_size
+        self._sentence_size = sentence_size
+        self._memory_size = memory_size
+        self._embedding_size = embedding_size
+        self._hops = hops
+        self._nonlin = nonlin
+        self._use_cuda = use_cuda
+        
+        self._encoding = autograd.Variable(torch.from_numpy(encoding(self._sentence_size, self._embedding_size)))
+        if use_cuda:
+            self._encoding = self._encoding.cuda()
+
+        
+        # in the original implement via tensorflow, a zero vector is used to represent the nil word that doesn't need gradients.
+        # Here, we put it together with other words for simplicity.
+        # in the paper, if using the adjacent mode, B = A_1, C_k = A_(k+1), C_K = W
+        # so if hops=3, we only need to define A_1 (B), C_1 (A_2), C_2 (A_3), C_3 (W)
+        self.A_1 = nn.Embedding(self._vocab_size, self._embedding_size)
+        self.A_1.weight.data[0].zero_()
+        
+        self.C = []
+        for hopn in range(self._hops):
+            temp = nn.Embedding(self._vocab_size, self._embedding_size)
+            temp.weight.data[0].zero_()
+            self.add_module("C_{}".format(hopn+1), temp)
+            self.C.append(temp)
+        
+        # In my experiment, distinct C_3 and W may cause better performance.    
+        self.W = nn.Parameter(torch.randn(self._embedding_size, self._vocab_size))
+        
+        
+        # We use 3d nil word embeddings for queries and 4d for stories. 
+        # These variables are used in _inference2
+        self._nil_word_slot_3d = autograd.Variable(torch.zeros(1, 1, self._embedding_size))
+        self._nil_word_slot_4d = autograd.Variable(torch.zeros(1, 1, 1, self._embedding_size))
+        if use_cuda:
+            self._nil_word_slot_3d = self._nil_word_slot_3d.cuda()
+            self._nil_word_slot_4d = self._nil_word_slot_4d.cuda()
+            
+        # These variables are used in _inference3. They are using as lookup tables instead of nn.Embedding
+        # The nil word is not included
+        self._nil_word_slot = autograd.Variable(torch.zeros(1, self._embedding_size))
+        self.A_1_lookup = nn.Parameter(torch.randn(self._vocab_size-1, self._embedding_size))
+
+        self.C_lookup = []
+        for hopn in range(self._hops):
+            temp = nn.Parameter(torch.randn(self._vocab_size-1, self._embedding_size))
+            self.register_parameter("C_{}_lookup".format(hopn+1), temp)
+            self.C_lookup.append(temp)
+
+            
+    # stories (batch_size, memory_size, sentence_size), e.g., (32, 10, 7)
+    # queries (batch_size, sentence_size), e.g., (32, 7)
+    def _inference1(self, stories, queries):
+        # (32, 7, 20), 20 is embedding_size
+        q_emb = self.A_1(queries)
+        # (32, 7, 20), self._encoding is (7, 20)
+        u_0 = q_emb * self._encoding
+        # (32, 20)
+        u_0 = torch.sum(u_0, 1)
+
+        u = [u_0]
+        
+        for hopn in range(self._hops):
+            if hopn == 0:
+                # nn.Embedding only supports 2D tensors, so stories will be transformed into (32x10, 7)
+                m_emb_A = self.A_1(stories.view(-1, stories.size(2)))
+            else:
+                m_emb_A = self.C[hopn - 1](stories.view(-1, stories.size(2)))
+            # (32, 10, 7, 20)  
+            m_emb_A = m_emb_A.view(stories.size()[0], stories.size()[1], stories.size()[2], -1)
+
+            # (32, 10, 20)
+            m_A = torch.sum(m_emb_A * self._encoding, 2)
+            # (32, 1, 20)
+            u_temp = torch.unsqueeze(u[-1], 1)
+
+            # (32, 10)
+            dotted = torch.sum(m_A * u_temp, 2)
+            # (32, 10)
+            probs = F.softmax(dotted, 1)
+            
+            # (32, 10, 1)
+            probs_temp = torch.unsqueeze(probs, 2)
+            # (32, 10, 7, 20)
+            m_emb_C = self.C[hopn](stories.view(-1, stories.size(2)))
+            m_emb_C = m_emb_C.view(stories.size()[0], stories.size()[1], stories.size()[2], -1)
+            # (32, 10, 20)
+            m_C = torch.sum(m_emb_C * self._encoding, 2)
+            # (32, 20)
+            o_k = torch.sum(m_C * probs_temp, 1)
+            # (32, 20)
+            u_k = u[-1] + o_k
+            
+            if self._nonlin:
+                u_k = self._nonlin(u_k)
+
+            u.append(u_k)
+            
+#         W = self.C[-1].weight
+        # (32, vocab_size)
+#         output = torch.matmul(u[-1], W.t())
+        output = torch.matmul(u[-1], self.W)
+                
+        return output
+    
+    # similar with _inference1, but considering the nil word
+    # Such method is very slow and it should be improved.
+    def _inference2(self, stories, queries):
+        # (32, 7, 20), 20 is embedding_size
+        q_emb = self._getEmb(queries, self.A_1)
+        # (32, 7, 20), self._encoding is (7, 20)
+        u_0 = q_emb * self._encoding
+        # (32, 20)
+        u_0 = torch.sum(u_0, 1)
+
+        u = [u_0]
+        
+        for hopn in range(self._hops):
+            if hopn == 0:
+                # nn.Embedding only supports 2D tensors, so stories will be transformed into (32x10, 7)
+                m_emb_A = self._getEmb(stories, self.A_1)
+            else:
+                m_emb_A = self._getEmb(stories, self.C[hopn - 1])
+
+            # (32, 10, 20)
+            m_A = torch.sum(m_emb_A * self._encoding, 2)
+            # (32, 1, 20)
+            u_temp = torch.unsqueeze(u[-1], 1)
+
+            # (32, 10)
+            dotted = torch.sum(m_A * u_temp, 2)
+            # (32, 10)
+            probs = F.softmax(dotted, 1)
+            
+            # (32, 10, 1)
+            probs_temp = torch.unsqueeze(probs, 2)
+            # (32, 10, 7, 20)
+            m_emb_C = self._getEmb(stories, self.C[hopn])
+            # (32, 10, 20)
+            m_C = torch.sum(m_emb_C * self._encoding, 2)
+            # (32, 20)
+            o_k = torch.sum(m_C * probs_temp, 1)
+            # (32, 20)
+            u_k = u[-1] + o_k
+            
+            if self._nonlin:
+                u_k = self._nonlin(u_k)
+
+            u.append(u_k)
+            
+#         W = self.C[-1].weight
+        # (32, vocab_size)
+#         output = torch.matmul(u[-1], W.t())
+        output = torch.matmul(u[-1], self.W)
+                
+        return output
+    
+    # Instead of using nn.Embedding, this function fetches embedding directly.
+    # It needs one-hot inputs.
+    def _inference3(self, stories, queries):
+        
+        A_1 = torch.cat((self._nil_word_slot, self.A_1_lookup),0)
+        q_emb = torch.matmul(queries, A_1)
+        # (32, 7, 20), self._encoding is (7, 20)
+        u_0 = q_emb * self._encoding
+        # (32, 20)
+        u_0 = torch.sum(u_0, 1)
+
+        u = [u_0]
+        
+        for hopn in range(self._hops):
+            
+            if hopn == 0:
+                m_emb_A = torch.matmul(stories, A_1)
+                
+            else:
+                C_hopn_1 = torch.cat((self._nil_word_slot, self.C_lookup[hopn - 1]))
+                m_emb_A = torch.matmul(stories, C_hopn_1)
+
+            # (32, 10, 20)
+            m_A = torch.sum(m_emb_A * self._encoding, 2)
+            # (32, 1, 20)
+            u_temp = torch.unsqueeze(u[-1], 1)
+
+            # (32, 10)
+            dotted = torch.sum(m_A * u_temp, 2)
+            # (32, 10)
+            probs = F.softmax(dotted, 1)
+            
+            # (32, 10, 1)
+            probs_temp = torch.unsqueeze(probs, 2)
+            # (32, 10, 7, 20)
+            C_hopn = torch.cat((self._nil_word_slot, self.C_lookup[hopn]))
+            m_emb_C = torch.matmul(stories, C_hopn)
+            # (32, 10, 20)
+            m_C = torch.sum(m_emb_C * self._encoding, 2)
+            # (32, 20)
+            o_k = torch.sum(m_C * probs_temp, 1)
+            # (32, 20)
+            u_k = u[-1] + o_k
+            
+            if self._nonlin:
+                u_k = self._nonlin(u_k)
+
+            u.append(u_k)
+            
+#         W = self.C[-1].weight
+        # (32, vocab_size)
+#         output = torch.matmul(u[-1], W.t())
+        output = torch.matmul(u[-1], self.W)
+                
+        return output
+    
+    def batch_fit(self, stories, queries, answers, criterion):
+        """Runs the training algorithm over the passed batch
+
+        Args:
+            stories: Variable (batch_size, memory_size, sentence_size)
+            queries: Variable (batch_size, sentence_size)
+            answers: Variable (batch_size, vocab_size)
+
+        Returns:
+            loss: Variable (1)
+        """
+        
+        
+#         output = self._inference1(stories, queries)
+#         output = self._inference2(stories, queries)
+        output = self._inference3(stories, queries)
+        loss = criterion(output, answers)
+
+        return loss    
+            
+    def predict(self, stories, queries):
+        """Predicts answers as targets. For example, [2,3,5,6,0,1...]
+
+        Args:
+            stories: Variable (batch_size, memory_size, sentence_size)
+            queries: Variable (batch_size, sentence_size)
+
+        Returns:
+            answers: Variable (batch_size)
+        """
+#         output = self._inference1(stories, queries)
+#         output = self._inference2(stories, queries)
+        output = self._inference3(stories, queries)
+        _, targets = torch.max(output, 1)
+        return targets   
+
+            
+    def _getEmb(self, wordIdxMatrix, lookuptable):     
+        """Given a word index matrix, return its embeddings. 
+        
+        The nil word embedding is not finetuned, it should be considering specially.
+
+        Args:
+            wordIdxMatrix: Variable (batch_size, memory_size, sentence_size) or (batch_size, sentence_size)
+            lookuptable: nn.Embedding to look up
+
+        Returns:
+            embs: Variable (batch_size, memory_size, sentence_size, embedding_size) or (batch_size, sentence_size, embedding_size)
+        """
+        
+        dim = len(wordIdxMatrix.size())
+        
+        assert dim==2 or dim==3
+        
+        if dim==2:
+            
+            emb_batch_list = []
+            
+            for i in range(wordIdxMatrix.size()[0]):
+                emb_row_list = []
+                
+                for j in range(wordIdxMatrix.size()[1]):
+                    idx = wordIdxMatrix.data[i][j]
+
+                    if idx == 0:
+                        emb = self._nil_word_slot_3d
+                    else:
+                        var_idx = autograd.Variable(torch.LongTensor(1, 1))
+                        var_idx.data[0][0] = idx
+                        emb = lookuptable(var_idx)
+                    
+                    emb_row_list.append(emb)
+                    
+                emb_row = torch.cat(emb_row_list, 1)
+                
+                emb_batch_list.append(emb_row)
+                
+            emb_batch = torch.cat(emb_batch_list, 0)
+            return emb_batch
+            
+        else:
+            
+            emb_batch_list = []
+            
+            for i in range(wordIdxMatrix.size()[0]):
+                emb_row_list = []
+                
+                for j in range(wordIdxMatrix.size()[1]):
+                    
+                    emb_column_list = []
+                    
+                    for k in range(wordIdxMatrix.size()[2]):
+                        
+                        idx = wordIdxMatrix.data[i][j][k]
+                        
+                        if idx == 0:
+                            emb = self._nil_word_slot_4d
+                        else:
+                            var_idx = autograd.Variable(torch.LongTensor(1, 1))
+                            var_idx.data[0][0] = idx
+                            emb = lookuptable(var_idx).unsqueeze(0)
+                            
+                        emb_column_list.append(emb)
+                        
+                    emb_column = torch.cat(emb_column_list, 2)
+                    
+                    emb_row_list.append(emb_column)
+                
+                emb_row = torch.cat(emb_row_list, 1)      
+                
+                emb_batch_list.append(emb_row)
+                
+            emb_batch = torch.cat(emb_batch_list, 0)
+        
+            return emb_batch
+        
+        
+        
+        
